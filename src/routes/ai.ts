@@ -11,37 +11,71 @@ const MIN_CREDITS_REQUIRED = 5;
 
 function getClient(): Anthropic {
   const apiKey = process.env["ANTHROPIC_API_KEY"];
-  if (!apiKey) {
-    throw new Error("ANTHROPIC_API_KEY is not configured on this server.");
-  }
+  if (!apiKey) throw new Error("ANTHROPIC_API_KEY is not configured on this server.");
   return new Anthropic({ apiKey });
 }
 
-function buildSystemPrompt(headers: string[], colTypes: Record<string, string>, rowCount: number, fileName: string): string {
-  const colDefs = headers
-    .map(h => `  - "${h}" (${colTypes[h] ?? "VARCHAR"})`)
-    .join("\n");
+function buildQueryPrompt(
+  headers: string[],
+  colTypes: Record<string, string>,
+  rowCount: number,
+  fileName: string,
+  msgHistory: Array<{ role: string; content: string }>,
+): string {
+  const colDefs = headers.map(h => `  - "${h}" (${colTypes[h] ?? "VARCHAR"})`).join("\n");
+  const histCtx = msgHistory.length
+    ? `\nConversation so far:\n${msgHistory.map(m => `${m.role === "user" ? "User" : "AI"}: ${m.content}`).join("\n")}\n`
+    : "";
 
-  return `You are a data analyst assistant for MasterX, a high-performance data grid tool.
-The user has uploaded a dataset called "${fileName}" with ${rowCount.toLocaleString()} rows.
+  return `You are a conversational data analyst assistant inside MasterX, a data grid tool.
+The user has uploaded "${fileName}" with ${rowCount.toLocaleString()} rows.
 
 Column schema:
 ${colDefs}
+${histCtx}
+Answer the user's question by writing a DuckDB SQL query and explaining the result in plain English.
 
-Your job is to answer the user's question by writing a DuckDB SQL query, then explain the result in plain English.
-
-Rules:
-1. ALWAYS respond in this exact JSON format (no markdown, no code fences):
-{
-  "sql": "SELECT ... FROM data LIMIT 100",
-  "explanation": "Here is what I found..."
+RULES:
+1. Respond in EXACTLY this JSON (no markdown, no code fences):
+{"type":"query","sql":"SELECT ... FROM data LIMIT 100","explanation":"Here is what I found..."}
+2. Table name is always "data".
+3. LIMIT SQL to 200 rows unless asked for more.
+4. Use DuckDB syntax (ILIKE, TRY_CAST, STRFTIME, etc.).
+5. If the question needs no SQL (chitchat, clarification), set "sql":"" and answer in "explanation".
+6. Never DROP, DELETE, INSERT, UPDATE — read-only only.
+7. Quote column names that have spaces or special chars.`;
 }
-2. The table name is always "data" — use it exactly.
-3. LIMIT your SQL to 200 rows maximum unless the user explicitly asks for more.
-4. Use DuckDB SQL syntax (ILIKE, TRY_CAST, STRFTIME, etc.).
-5. If the question cannot be answered with SQL (e.g. it's a general question), set "sql" to "" and answer in "explanation".
-6. Never DROP, DELETE, INSERT, UPDATE or modify data — read-only queries only.
-7. Column names with spaces or special chars must be double-quoted.`;
+
+function buildTransformPrompt(
+  headers: string[],
+  colTypes: Record<string, string>,
+  rowCount: number,
+  fileName: string,
+  msgHistory: Array<{ role: string; content: string }>,
+): string {
+  const colDefs = headers.map(h => `  - "${h}" (${colTypes[h] ?? "VARCHAR"})`).join("\n");
+  const histCtx = msgHistory.length
+    ? `\nConversation so far:\n${msgHistory.map(m => `${m.role === "user" ? "User" : "AI"}: ${m.content}`).join("\n")}\n`
+    : "";
+
+  return `You are a Python data transformation expert inside MasterX, a data grid tool.
+The user has "${fileName}" with ${rowCount.toLocaleString()} rows.
+
+Column schema:
+${colDefs}
+${histCtx}
+Write Python code to transform the data as requested.
+
+RULES:
+1. Respond in EXACTLY this JSON (no markdown, no code fences):
+{"type":"transform","python_code":"...","explanation":"Here is what the code does..."}
+2. Variable "df" is already a pandas DataFrame with all data — do NOT recreate it.
+3. At the end you MUST assign: result = {"headers": df.columns.tolist(), "rows": df.to_dict("records")}
+4. Available: pandas (pd), numpy (np), re, json, math, string, datetime, itertools, collections.
+5. FORBIDDEN: os, sys, subprocess, shutil, socket, urllib, requests, open(), exec(), eval(), compile(), __import__.
+6. Handle missing values gracefully (fillna, dropna).
+7. If the request is ambiguous do the most reasonable interpretation.
+8. If the request is impossible or dangerous, leave df unchanged and explain in "explanation".`;
 }
 
 /*
@@ -49,23 +83,33 @@ Rules:
  *
  * Body:
  *   session    — MasterX session ID
- *   message    — user's natural-language question
- *   credits    — user's current credit balance (passed from Bubble)
+ *   message    — user's natural-language question or instruction
+ *   credits    — user's current credit balance
+ *   mode       — "query" (default) | "transform"
+ *   history    — optional array of {role,content} for conversation context
  *
- * Success response:
- *   { ok: true, answer, sql, rows, tokensUsed, creditsUsed }
+ * Query response:
+ *   { ok:true, type:"query", answer, sql, rows, tokensUsed, creditsUsed }
  *
- * Credit-gate response (HTTP 402):
- *   { error: "insufficient_credits", creditsRequired: N, creditsAvailable: N }
+ * Transform response:
+ *   { ok:true, type:"transform", code, explanation, tokensUsed, creditsUsed }
  *
- * Error response (HTTP 4xx/5xx):
- *   { error: "..." }
+ * Credit-gate (402):
+ *   { error:"insufficient_credits", creditsRequired, creditsAvailable }
  */
 router.post("/mx/ai", async (req: Request, res: Response) => {
-  const { session, message, credits } = req.body as {
+  const {
+    session,
+    message,
+    credits,
+    mode = "query",
+    history = [],
+  } = req.body as {
     session: string;
     message: string;
     credits: number;
+    mode?: "query" | "transform";
+    history?: Array<{ role: string; content: string }>;
   };
 
   if (!message || typeof message !== "string" || message.trim().length === 0) {
@@ -97,7 +141,10 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
     return;
   }
 
-  const systemPrompt = buildSystemPrompt(s.headers, s.colTypes, s.rowCount, s.fileName);
+  const msgHistory = Array.isArray(history) ? history.slice(-6) : [];
+  const systemPrompt = mode === "transform"
+    ? buildTransformPrompt(s.headers, s.colTypes, s.rowCount, s.fileName, msgHistory)
+    : buildQueryPrompt(s.headers, s.colTypes, s.rowCount, s.fileName, msgHistory);
 
   try {
     const response = await client.messages.create({
@@ -117,15 +164,21 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
       .map(b => (b as { type: "text"; text: string }).text)
       .join("");
 
-    let parsed: { sql: string; explanation: string };
+    let parsed: { type?: string; sql?: string; explanation?: string; python_code?: string };
     try {
       parsed = JSON.parse(rawText);
     } catch {
+      res.json({ ok: true, type: mode, answer: rawText, sql: "", code: "", rows: [], tokensUsed: totalTokens, creditsUsed });
+      return;
+    }
+
+    if (mode === "transform" || parsed.type === "transform") {
+      logger.info({ sessionId: session, mode: "transform", tokensUsed: totalTokens, creditsUsed }, "AI transform completed");
       res.json({
         ok: true,
-        answer: rawText,
-        sql: "",
-        rows: [],
+        type: "transform",
+        code: parsed.python_code ?? "",
+        explanation: parsed.explanation ?? "",
         tokensUsed: totalTokens,
         creditsUsed,
       });
@@ -144,6 +197,7 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
         logger.warn({ sql, err: sqlErr }, "AI-generated SQL failed");
         res.json({
           ok: true,
+          type: "query",
           answer: `${explanation}\n\n⚠️ Note: The generated query could not run — ${(sqlErr as Error).message}`,
           sql,
           rows: [],
@@ -154,19 +208,8 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
       }
     }
 
-    logger.info(
-      { sessionId: session, tokensUsed: totalTokens, creditsUsed, rowsReturned: rows.length },
-      "AI query completed"
-    );
-
-    res.json({
-      ok: true,
-      answer: explanation,
-      sql,
-      rows,
-      tokensUsed: totalTokens,
-      creditsUsed,
-    });
+    logger.info({ sessionId: session, mode: "query", tokensUsed: totalTokens, creditsUsed, rowsReturned: rows.length }, "AI query completed");
+    res.json({ ok: true, type: "query", answer: explanation, sql, rows, tokensUsed: totalTokens, creditsUsed });
   } catch (err) {
     logger.error(err, "AI endpoint error");
     res.status(500).json({ error: (err as Error).message });
