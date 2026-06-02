@@ -439,6 +439,10 @@ router.patch("/mx/cell", async (req: Request, res: Response) => {
     );
     fs.renameSync(tmpPath, s.dataPath);
     s.sortCache.clear();
+    logger.info(
+      { sessionId: s.sessionId, row: rowIdx, col, value: safeVal },
+      `BACKEND: edited cell — column "${col}", row ${rowIdx}`,
+    );
     res.json({ ok: true });
   } catch (err) {
     try {
@@ -812,6 +816,17 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
       await refreshSessionMeta(s);
     }
 
+    logger.info(
+      {
+        sessionId: s.sessionId,
+        operation,
+        column: params?.col ?? params?.newName ?? params?.newColName ?? null,
+        rowCount: s.rowCount,
+        colCount: s.colCount,
+      },
+      `BACKEND: bulk-transform "${operation}"${params?.col ? ` on column "${params.col}"` : ""} — ${s.rowCount} rows`,
+    );
+
     res.json({
       ok: true,
       rowCount: s.rowCount,
@@ -861,6 +876,15 @@ router.post("/mx/apply-sql", async (req: Request, res: Response) => {
     await run(wrappedSql);
     fs.renameSync(tmpPath, s.dataPath);
     await refreshSessionMeta(s);
+    logger.info(
+      {
+        sessionId: s.sessionId,
+        sql: sql.trim(),
+        rowCount: s.rowCount,
+        colCount: s.colCount,
+      },
+      `BACKEND: applied SQL transform — ${s.rowCount} rows, ${s.colCount} columns`,
+    );
     res.json({
       ok: true,
       rowCount: s.rowCount,
