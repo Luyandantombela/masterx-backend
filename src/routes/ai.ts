@@ -18,7 +18,7 @@ function getClient(): Anthropic {
 /* ── DuckDB reader expression for stored CSV ── */
 function srcExpr(dataPath: string): string {
   const p = dataPath.replace(/'/g, "''");
-  return `read_csv_auto('${p}', header=true, max_line_size=134217728, ignore_errors=true)`;
+  return `read_csv_auto('${p}', header=true, max_line_size=1048576, ignore_errors=true)`;
 }
 
 function buildQueryPrompt(
@@ -64,24 +64,31 @@ function buildTransformPrompt(
     ? `\nConversation so far:\n${msgHistory.map(m => `${m.role === "user" ? "User" : "AI"}: ${m.content}`).join("\n")}\n`
     : "";
 
-  return `You are a Python data transformation expert inside MasterX, a data grid tool.
-The user has "${fileName}" with ${rowCount.toLocaleString()} rows.
+  return `You are a DuckDB SQL expert inside MasterX, a data transformation tool.
+The user wants to transform "${fileName}" which has ${rowCount.toLocaleString()} rows.
 
 Column schema:
 ${colDefs}
 ${histCtx}
-Write Python code to transform the data as requested.
+Write a DuckDB SQL SELECT statement that transforms the data as the user requests.
 
 RULES:
 1. Respond in EXACTLY this JSON (no markdown, no code fences):
-{"type":"transform","python_code":"...","explanation":"Here is what the code does..."}
-2. Variable "df" is already a pandas DataFrame with all data — do NOT recreate it.
-3. At the end you MUST assign: result = {"headers": df.columns.tolist(), "rows": df.to_dict("records")}
-4. Available: pandas (pd), numpy (np), re, json, math, string, datetime, itertools, collections.
-5. FORBIDDEN: os, sys, subprocess, shutil, socket, urllib, requests, open(), exec(), eval(), compile(), __import__.
-6. Handle missing values gracefully (fillna, dropna).
-7. If the request is ambiguous, do the most reasonable interpretation.
-8. If the request is impossible or dangerous, leave df unchanged and explain in "explanation".`;
+{"type":"transform","sql":"SELECT ...","explanation":"Here is what this transform does..."}
+2. The source table is always named "data" — always use FROM data (or WITH data AS ...).
+3. Your SQL must be a SELECT that produces the COMPLETE desired output table.
+4. Available DuckDB functions: initcap(), lower(), upper(), trim(), concat(), strftime(),
+   TRY_CAST(), printf(), string_split(), string_split_regex(), regexp_replace(),
+   coalesce(), nullif(), starts_with(), ends_with(), left(), right(), length(), substr().
+5. To rename a column: include it as "old_col" AS "new_col" in your SELECT list.
+6. To delete a column: SELECT only the columns you want to keep (omit the deleted one).
+7. To add a new column: SELECT *, (expression) AS "new_col_name" FROM data.
+8. To reformat dates: strftime(TRY_CAST("col" AS DATE), '%Y-%m-%d') etc.
+9. To standardize numbers: printf('%.2f', TRY_CAST("col" AS DOUBLE)).
+10. Use CASE WHEN col IS NULL OR col = '' THEN default ELSE col END for null-safety.
+11. Never use DELETE, DROP, INSERT, UPDATE, CREATE — SELECT only.
+12. If the request is ambiguous, do the most reasonable interpretation and explain.
+13. If impossible or dangerous, return sql:"" and explain in "explanation".`;
 }
 
 /*
@@ -98,7 +105,7 @@ RULES:
  *   { ok:true, type:"query", answer, sql, rows, tokensUsed, creditsUsed }
  *
  * Transform response:
- *   { ok:true, type:"transform", code, explanation, tokensUsed, creditsUsed }
+ *   { ok:true, type:"transform", sql, explanation, tokensUsed, creditsUsed }
  */
 router.post("/mx/ai", async (req: Request, res: Response) => {
   const {
@@ -167,23 +174,23 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
       .map(b => (b as { type: "text"; text: string }).text)
       .join("");
 
-    let parsed: { type?: string; sql?: string; explanation?: string; python_code?: string };
+    let parsed: { type?: string; sql?: string; explanation?: string };
     try {
       parsed = JSON.parse(rawText);
     } catch {
-      res.json({ ok: true, type: mode, answer: rawText, sql: "", code: "", rows: [], tokensUsed: totalTokens, creditsUsed });
+      res.json({ ok: true, type: mode, answer: rawText, sql: "", rows: [], tokensUsed: totalTokens, creditsUsed });
       return;
     }
 
-    /* ── Transform response ── */
+    /* ── Transform response — return SQL for the frontend to confirm + apply ── */
     if (mode === "transform" || parsed.type === "transform") {
-      logger.info({ sessionId: session, mode: "transform", tokensUsed: totalTokens, creditsUsed }, "AI transform completed");
+      logger.info({ sessionId: session, mode: "transform", tokensUsed: totalTokens, creditsUsed }, "AI transform SQL generated");
       res.json({
-        ok: true,
-        type: "transform",
-        code: parsed.python_code ?? "",
+        ok:          true,
+        type:        "transform",
+        sql:         parsed.sql ?? "",
         explanation: parsed.explanation ?? "",
-        tokensUsed: totalTokens,
+        tokensUsed:  totalTokens,
         creditsUsed,
       });
       return;
@@ -194,18 +201,17 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
     let rows: Record<string, unknown>[] = [];
 
     if (sql && sql.trim().length > 0) {
-      /* Wrap with a CTE so the AI's "FROM data" works against the CSV */
       const wrappedSql = `WITH data AS (SELECT * FROM ${srcExpr(s.dataPath)}) ${sql}`;
       try {
         rows = await query(wrappedSql);
       } catch (sqlErr) {
         logger.warn({ sql, err: sqlErr }, "AI-generated SQL failed");
         res.json({
-          ok: true,
-          type: "query",
+          ok:     true,
+          type:   "query",
           answer: `${explanation}\n\n⚠️ Note: The generated query could not run — ${(sqlErr as Error).message}`,
           sql,
-          rows: [],
+          rows:   [],
           tokensUsed: totalTokens,
           creditsUsed,
         });
