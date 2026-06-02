@@ -8,6 +8,7 @@ import { logger } from "../lib/logger.js";
 
 const router = Router();
 
+/* ── Multer: accept CSV and JSON only, store to UPLOAD_DIR ── */
 const upload = multer({
   dest: UPLOAD_DIR,
   limits: { fileSize: 2 * 1024 * 1024 * 1024 },
@@ -18,12 +19,35 @@ const upload = multer({
   },
 });
 
+/* ── DuckDB reader expression for a stored CSV ── */
+function srcExpr(dataPath: string): string {
+  const p = dataPath.replace(/'/g, "''");
+  return `read_csv_auto('${p}', header=true, max_line_size=134217728, ignore_errors=true)`;
+}
+
+/* ── Minimal JS CSV writer (used for JSON-body uploads from XLSX) ── */
+function rowsToCsv(headers: string[], rows: Record<string, unknown>[]): string {
+  const esc = (v: unknown) => {
+    const s = String(v ?? "");
+    return s.includes(",") || s.includes('"') || s.includes("\n") || s.includes("\r")
+      ? '"' + s.replace(/"/g, '""') + '"'
+      : s;
+  };
+  const lines: string[] = [headers.map(esc).join(",")];
+  for (const row of rows) lines.push(headers.map(h => esc(row[h])).join(","));
+  return lines.join("\n");
+}
+
 function parseCols(colsParam: string | undefined, allHeaders: string[]): string[] {
   if (!colsParam) return [];
   return colsParam.split(",").map(c => c.trim()).filter(c => allHeaders.includes(c));
 }
 
-function buildWhere(conditions: Array<{ col: string; op: string; value: string }>, searchQ: string, headers: string[]): string {
+function buildWhere(
+  conditions: Array<{ col: string; op: string; value: string }>,
+  searchQ: string,
+  headers: string[],
+): string {
   const parts: string[] = [];
 
   for (const { col, op, value } of conditions) {
@@ -52,52 +76,86 @@ function buildWhere(conditions: Array<{ col: string; op: string; value: string }
   return parts.length ? `WHERE ${parts.join(" AND ")}` : "";
 }
 
-/* ── POST /api/mx/upload ── */
+/* ── POST /api/mx/upload ──
+ *  Accepts:
+ *   a) multipart/form-data with field "file" (CSV or JSON)
+ *   b) application/json body: { headers, rows, fileName } (from XLSX converted in-browser)
+ *
+ *  Strategy: store data as a plain CSV file — NO Parquet conversion.
+ *  DuckDB queries the CSV directly via read_csv_auto(), which streams
+ *  from disk and requires no large memory allocation.
+ */
 router.post("/mx/upload", upload.single("file"), async (req: Request, res: Response) => {
   try {
     const { v4: uuidv4 } = await import("uuid");
-    const parquetId = uuidv4();
-    const parquetPath = path.join(UPLOAD_DIR, `${parquetId}.parquet`);
-    let fileName = "upload";
+    const fileId  = uuidv4();
+    const csvPath = path.join(UPLOAD_DIR, `${fileId}.csv`);
+    let fileName  = "upload";
 
     if (req.file) {
+      /* ── Multipart CSV or JSON file ── */
       fileName = req.file.originalname;
-      const csvPath = req.file.path;
-      await run(`COPY (SELECT * FROM read_csv_auto('${csvPath.replace(/'/g, "''")}', header=true, max_line_size=134217728)) TO '${parquetPath}' (FORMAT PARQUET)`);
-      fs.unlinkSync(csvPath);
+      const tmpPath = req.file.path;
+
+      if (/\.json$/i.test(fileName)) {
+        /* JSON → convert to CSV via DuckDB (small files only, so safe) */
+        const jsonSafe = tmpPath.replace(/'/g, "''");
+        await run(
+          `COPY (SELECT * FROM read_json_auto('${jsonSafe}'))` +
+          ` TO '${csvPath.replace(/'/g, "''")}' (FORMAT CSV, HEADER true)`,
+        );
+        fs.unlinkSync(tmpPath);
+      } else {
+        /* CSV → rename the temp file to our permanent CSV path */
+        fs.renameSync(tmpPath, csvPath);
+      }
+
     } else if (req.body?.headers && req.body?.rows) {
+      /* ── JSON body (XLSX converted in-browser) ── */
       fileName = req.body.fileName || "data";
-      const { headers, rows } = req.body as { headers: string[]; rows: Record<string, unknown>[] };
+      const { headers, rows } = req.body as {
+        headers: string[];
+        rows: Record<string, unknown>[];
+      };
 
       if (!Array.isArray(headers) || !Array.isArray(rows)) {
         res.status(400).json({ error: "Invalid body: headers and rows must be arrays" });
         return;
       }
 
-      const jsonPath = path.join(UPLOAD_DIR, `${parquetId}.json`);
-      fs.writeFileSync(jsonPath, JSON.stringify(rows));
-      const colList = headers.map(h => `"${h.replace(/"/g, '""')}"`).join(", ");
-      await run(`COPY (SELECT ${colList} FROM read_json_auto('${jsonPath.replace(/'/g, "''")}')) TO '${parquetPath}' (FORMAT PARQUET)`);
-      fs.unlinkSync(jsonPath);
+      /* Write directly as CSV — no DuckDB memory needed */
+      fs.writeFileSync(csvPath, rowsToCsv(headers, rows), "utf8");
+
     } else {
       res.status(400).json({ error: "Provide a CSV file (multipart) or JSON body {headers, rows}" });
       return;
     }
 
+    /* ── Introspect the CSV with DuckDB (metadata only, O(n) scan) ── */
     const metaRows = await query<{ column_name: string; column_type: string }>(
-      `DESCRIBE SELECT * FROM read_parquet('${parquetPath.replace(/'/g, "''")}') LIMIT 0`
+      `DESCRIBE SELECT * FROM ${srcExpr(csvPath)} LIMIT 0`,
     );
-    const countRows = await query<{ total: number }>(`SELECT COUNT(*) as total FROM read_parquet('${parquetPath.replace(/'/g, "''")}')`);
+    const countRows = await query<{ total: number }>(
+      `SELECT COUNT(*) as total FROM ${srcExpr(csvPath)}`,
+    );
 
-    const headers = metaRows.map(r => r.column_name);
+    const headers  = metaRows.map(r => r.column_name);
     const colTypes: Record<string, string> = {};
     for (const r of metaRows) colTypes[r.column_name] = r.column_type;
     const rowCount = Number(countRows[0]?.total ?? 0);
 
-    const session = createSession({ fileName, parquetPath, rowCount, colCount: headers.length, headers, colTypes });
-    logger.info({ sessionId: session.sessionId, rowCount, cols: headers.length, fileName }, "Session created");
+    const session = createSession({
+      fileName,
+      dataPath: csvPath,
+      rowCount,
+      colCount: headers.length,
+      headers,
+      colTypes,
+    });
 
+    logger.info({ sessionId: session.sessionId, rowCount, cols: headers.length, fileName }, "Session created");
     res.json({ sessionId: session.sessionId, rowCount, colCount: headers.length, headers, colTypes, fileName });
+
   } catch (err) {
     logger.error(err, "Upload failed");
     res.status(500).json({ error: (err as Error).message });
@@ -108,7 +166,10 @@ router.post("/mx/upload", upload.single("file"), async (req: Request, res: Respo
 router.get("/mx/meta", (req: Request, res: Response) => {
   const s = getSession(req.query.session as string);
   if (!s) { res.status(404).json({ error: "Session not found or expired" }); return; }
-  res.json({ sessionId: s.sessionId, fileName: s.fileName, rowCount: s.rowCount, colCount: s.colCount, headers: s.headers, colTypes: s.colTypes });
+  res.json({
+    sessionId: s.sessionId, fileName: s.fileName, rowCount: s.rowCount,
+    colCount: s.colCount, headers: s.headers, colTypes: s.colTypes,
+  });
 });
 
 /* ── GET /api/mx/rows ── */
@@ -116,15 +177,17 @@ router.get("/mx/rows", async (req: Request, res: Response) => {
   const s = getSession(req.query.session as string);
   if (!s) { res.status(404).json({ error: "Session not found or expired" }); return; }
 
-  const from  = Math.max(0, parseInt(req.query.from as string) || 0);
-  const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit as string) || 100));
-  const cols  = parseCols(req.query.cols as string, s.headers);
-  const selectedCols = cols.length > 0 ? cols : s.headers.slice(0, 50);
-  const colList = selectedCols.map(c => `"${c.replace(/"/g, '""')}"`).join(", ");
+  const from   = Math.max(0, parseInt(req.query.from as string) || 0);
+  const limit  = Math.min(1000, Math.max(1, parseInt(req.query.limit as string) || 100));
+  const cols   = parseCols(req.query.cols as string, s.headers);
+  const selCols = cols.length > 0 ? cols : s.headers.slice(0, 50);
+  const colList = selCols.map(c => `"${c.replace(/"/g, '""')}"`).join(", ");
 
   try {
-    const rows = await query(`SELECT ${colList} FROM read_parquet('${s.parquetPath.replace(/'/g, "''")}') LIMIT ${limit} OFFSET ${from}`);
-    res.json({ rows, total: s.rowCount, from, limit, cols: selectedCols });
+    const rows = await query(
+      `SELECT ${colList} FROM ${srcExpr(s.dataPath)} LIMIT ${limit} OFFSET ${from}`,
+    );
+    res.json({ rows, total: s.rowCount, from, limit, cols: selCols });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -135,25 +198,25 @@ router.get("/mx/sort", async (req: Request, res: Response) => {
   const s = getSession(req.query.session as string);
   if (!s) { res.status(404).json({ error: "Session not found or expired" }); return; }
 
-  const col  = req.query.col as string;
-  const dir  = (req.query.dir as string)?.toLowerCase() === "desc" ? "DESC" : "ASC";
-  const from  = Math.max(0, parseInt(req.query.from as string) || 0);
-  const limit = Math.min(1000, Math.max(1, parseInt(req.query.limit as string) || 100));
-  const cols  = parseCols(req.query.cols as string, s.headers);
-  const selectedCols = cols.length > 0 ? cols : s.headers.slice(0, 50);
+  const col    = req.query.col as string;
+  const dir    = (req.query.dir as string)?.toLowerCase() === "desc" ? "DESC" : "ASC";
+  const from   = Math.max(0, parseInt(req.query.from as string) || 0);
+  const limit  = Math.min(1000, Math.max(1, parseInt(req.query.limit as string) || 100));
+  const cols   = parseCols(req.query.cols as string, s.headers);
+  const selCols = cols.length > 0 ? cols : s.headers.slice(0, 50);
 
   if (!s.headers.includes(col)) {
     res.status(400).json({ error: `Column "${col}" not found` }); return;
   }
 
-  const colList = selectedCols.map(c => `"${c.replace(/"/g, '""')}"`).join(", ");
+  const colList = selCols.map(c => `"${c.replace(/"/g, '""')}"`).join(", ");
   const sortCol = `"${col.replace(/"/g, '""')}"`;
 
   try {
     const rows = await query(
-      `SELECT ${colList} FROM read_parquet('${s.parquetPath.replace(/'/g, "''")}') ORDER BY ${sortCol} ${dir} NULLS LAST LIMIT ${limit} OFFSET ${from}`
+      `SELECT ${colList} FROM ${srcExpr(s.dataPath)} ORDER BY ${sortCol} ${dir} NULLS LAST LIMIT ${limit} OFFSET ${from}`,
     );
-    res.json({ rows, total: s.rowCount, from, limit, col, dir, cols: selectedCols });
+    res.json({ rows, total: s.rowCount, from, limit, col, dir, cols: selCols });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -165,19 +228,20 @@ router.post("/mx/filter", async (req: Request, res: Response) => {
   const s = getSession(session);
   if (!s) { res.status(404).json({ error: "Session not found or expired" }); return; }
 
-  const selectedCols = (cols && Array.isArray(cols) && cols.length > 0)
+  const selCols = (cols && Array.isArray(cols) && cols.length > 0)
     ? cols.filter((c: string) => s.headers.includes(c))
     : s.headers.slice(0, 50);
-  const colList = selectedCols.map((c: string) => `"${c.replace(/"/g, '""')}"`).join(", ");
-  const where = buildWhere(conditions, searchQ, s.headers);
+  const colList   = selCols.map((c: string) => `"${c.replace(/"/g, '""')}"`).join(", ");
+  const where     = buildWhere(conditions, searchQ, s.headers);
   const safeFrom  = Math.max(0, parseInt(from) || 0);
   const safeLimit = Math.min(1000, Math.max(1, parseInt(limit) || 100));
+  const src       = srcExpr(s.dataPath);
 
   try {
-    const countRes = await query<{ total: number }>(`SELECT COUNT(*) as total FROM read_parquet('${s.parquetPath.replace(/'/g, "''")}') ${where}`);
-    const total = Number(countRes[0]?.total ?? 0);
-    const rows  = await query(`SELECT ${colList} FROM read_parquet('${s.parquetPath.replace(/'/g, "''")}') ${where} LIMIT ${safeLimit} OFFSET ${safeFrom}`);
-    res.json({ rows, total, from: safeFrom, limit: safeLimit, cols: selectedCols });
+    const countRes = await query<{ total: number }>(`SELECT COUNT(*) as total FROM ${src} ${where}`);
+    const total    = Number(countRes[0]?.total ?? 0);
+    const rows     = await query(`SELECT ${colList} FROM ${src} ${where} LIMIT ${safeLimit} OFFSET ${safeFrom}`);
+    res.json({ rows, total, from: safeFrom, limit: safeLimit, cols: selCols });
   } catch (err) {
     res.status(500).json({ error: (err as Error).message });
   }
@@ -197,19 +261,18 @@ router.patch("/mx/cell", async (req: Request, res: Response) => {
 
   const safeCol  = col.replace(/"/g, '""');
   const safeVal  = String(value ?? "").replace(/'/g, "''");
-  const safePath = s.parquetPath.replace(/'/g, "''");
-  const tmpPath  = s.parquetPath.replace(".parquet", "_tmp.parquet");
+  const tmpPath  = s.dataPath.replace(".csv", "_tmp.csv");
 
   try {
-    await run(`
-      COPY (
-        SELECT * REPLACE (
-          CASE WHEN row_number() OVER () = ${rowIdx + 1} THEN '${safeVal}' ELSE "${safeCol}" END AS "${safeCol}"
-        )
-        FROM read_parquet('${safePath}')
-      ) TO '${tmpPath}' (FORMAT PARQUET)
-    `);
-    fs.renameSync(tmpPath, s.parquetPath);
+    await run(
+      `COPY (
+         SELECT * REPLACE (
+           CASE WHEN row_number() OVER () = ${rowIdx + 1} THEN '${safeVal}' ELSE "${safeCol}" END AS "${safeCol}"
+         )
+         FROM ${srcExpr(s.dataPath)}
+       ) TO '${tmpPath.replace(/'/g, "''")}' (FORMAT CSV, HEADER true)`,
+    );
+    fs.renameSync(tmpPath, s.dataPath);
     s.sortCache.clear();
     res.json({ ok: true });
   } catch (err) {
@@ -224,8 +287,9 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
   const s = getSession(session);
   if (!s) { res.status(404).json({ error: "Session not found or expired" }); return; }
 
-  const safePath = s.parquetPath.replace(/'/g, "''");
-  const tmpPath  = s.parquetPath.replace(".parquet", "_tmp.parquet");
+  const src     = srcExpr(s.dataPath);
+  const tmpPath = s.dataPath.replace(".csv", "_tmp.csv");
+  const tmpSafe = tmpPath.replace(/'/g, "''");
 
   try {
     let sql = "";
@@ -236,7 +300,7 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
         if (!s.headers.includes(col)) { res.status(400).json({ error: "Column not found" }); return; }
         const c = col.replace(/"/g, '""');
         const v = String(fillValue ?? "").replace(/'/g, "''");
-        sql = `COPY (SELECT * REPLACE (COALESCE(NULLIF("${c}", ''), '${v}') AS "${c}") FROM read_parquet('${safePath}')) TO '${tmpPath}' (FORMAT PARQUET)`;
+        sql = `COPY (SELECT * REPLACE (COALESCE(NULLIF("${c}", ''), '${v}') AS "${c}") FROM ${src}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
         break;
       }
       case "find-replace": {
@@ -245,28 +309,28 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
         const c = col.replace(/"/g, '""');
         const f = String(find ?? "").replace(/'/g, "''");
         const r = String(replace ?? "").replace(/'/g, "''");
-        sql = `COPY (SELECT * REPLACE (regexp_replace("${c}", '${f}', '${r}', 'g') AS "${c}") FROM read_parquet('${safePath}')) TO '${tmpPath}' (FORMAT PARQUET)`;
+        sql = `COPY (SELECT * REPLACE (regexp_replace("${c}", '${f}', '${r}', 'g') AS "${c}") FROM ${src}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
         break;
       }
       case "trim": {
         const { col } = params;
         if (!s.headers.includes(col)) { res.status(400).json({ error: "Column not found" }); return; }
         const c = col.replace(/"/g, '""');
-        sql = `COPY (SELECT * REPLACE (trim("${c}") AS "${c}") FROM read_parquet('${safePath}')) TO '${tmpPath}' (FORMAT PARQUET)`;
+        sql = `COPY (SELECT * REPLACE (trim("${c}") AS "${c}") FROM ${src}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
         break;
       }
       case "lowercase": {
         const { col } = params;
         if (!s.headers.includes(col)) { res.status(400).json({ error: "Column not found" }); return; }
         const c = col.replace(/"/g, '""');
-        sql = `COPY (SELECT * REPLACE (lower("${c}") AS "${c}") FROM read_parquet('${safePath}')) TO '${tmpPath}' (FORMAT PARQUET)`;
+        sql = `COPY (SELECT * REPLACE (lower("${c}") AS "${c}") FROM ${src}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
         break;
       }
       case "uppercase": {
         const { col } = params;
         if (!s.headers.includes(col)) { res.status(400).json({ error: "Column not found" }); return; }
         const c = col.replace(/"/g, '""');
-        sql = `COPY (SELECT * REPLACE (upper("${c}") AS "${c}") FROM read_parquet('${safePath}')) TO '${tmpPath}' (FORMAT PARQUET)`;
+        sql = `COPY (SELECT * REPLACE (upper("${c}") AS "${c}") FROM ${src}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
         break;
       }
       default:
@@ -274,10 +338,10 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
     }
 
     await run(sql);
-    fs.renameSync(tmpPath, s.parquetPath);
+    fs.renameSync(tmpPath, s.dataPath);
     s.sortCache.clear();
 
-    const countRes = await query<{ total: number }>(`SELECT COUNT(*) as total FROM read_parquet('${safePath}')`);
+    const countRes = await query<{ total: number }>(`SELECT COUNT(*) as total FROM ${srcExpr(s.dataPath)}`);
     res.json({ ok: true, affected: Number(countRes[0]?.total ?? 0) });
   } catch (err) {
     try { fs.unlinkSync(tmpPath); } catch {}
@@ -285,23 +349,23 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
   }
 });
 
-/* ── GET /api/mx/export ── */
-router.get("/mx/export", async (req: Request, res: Response) => {
+/* ── GET /api/mx/export ──
+ *  Stream the stored CSV directly — no DuckDB conversion needed.
+ */
+router.get("/mx/export", (req: Request, res: Response) => {
   const s = getSession(req.query.session as string);
   if (!s) { res.status(404).json({ error: "Session not found or expired" }); return; }
 
-  const csvPath = s.parquetPath.replace(".parquet", "_export.csv");
-  try {
-    await run(`COPY (SELECT * FROM read_parquet('${s.parquetPath.replace(/'/g, "''")}')) TO '${csvPath}' (FORMAT CSV, HEADER true)`);
-    res.setHeader("Content-Disposition", `attachment; filename="${s.fileName.replace(/"/g, "")}"`);
-    res.setHeader("Content-Type", "text/csv");
-    const stream = fs.createReadStream(csvPath);
-    stream.pipe(res);
-    stream.on("end", () => { try { fs.unlinkSync(csvPath); } catch {} });
-    stream.on("error", () => { try { fs.unlinkSync(csvPath); } catch {} res.end(); });
-  } catch (err) {
-    res.status(500).json({ error: (err as Error).message });
-  }
+  const safeName = s.fileName.replace(/"/g, "").replace(/\.[^.]+$/, "") + "_export.csv";
+  const size = (() => { try { return fs.statSync(s.dataPath).size; } catch { return 0; } })();
+
+  res.setHeader("Content-Disposition", `attachment; filename="${safeName}"`);
+  res.setHeader("Content-Type", "text/csv; charset=utf-8");
+  if (size > 0) res.setHeader("Content-Length", size.toString());
+
+  const stream = fs.createReadStream(s.dataPath);
+  stream.pipe(res);
+  stream.on("error", () => res.end());
 });
 
 /* ── DELETE /api/mx/session ── */
