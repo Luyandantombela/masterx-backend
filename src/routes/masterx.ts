@@ -226,9 +226,9 @@ function buildPredicates(
   }
   if (searchQ.trim()) {
     const sq = searchQ.replace(/'/g, "''");
-    const searchParts = headers
-      .slice(0, 20)
-      .map((h) => `"${h.replace(/"/g, '""')}" ILIKE '%${sq}%'`);
+    const searchParts = headers.map(
+      (h) => `"${h.replace(/"/g, '""')}" ILIKE '%${sq}%'`,
+    );
     if (searchParts.length) parts.push(`(${searchParts.join(" OR ")})`);
   }
   return parts;
