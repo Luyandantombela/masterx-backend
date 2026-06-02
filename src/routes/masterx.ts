@@ -1141,8 +1141,44 @@ router.post("/mx/apply-sql", async (req: Request, res: Response) => {
   const tmpPath = s.dataPath.replace(".csv", "_tmp.csv");
   const tmpSafe = tmpPath.replace(/'/g, "''");
 
-  /* Wrap the user SELECT in a CTE so "FROM data" resolves to the session CSV */
-  const wrappedSql = `COPY (WITH data AS (SELECT * FROM ${srcExpr(s.dataPath)}) ${sql.trim()}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
+  /* Scope the AI to the user's CONFIGURED view (active filters/search). When a
+   * filter is active, `data` resolves to ONLY the matching rows and rows the
+   * user filtered out are preserved unchanged (merged back by _mxidx). With no
+   * filter, `data` is the whole file and the result replaces the whole file.
+   *
+   * Contract when a filter is active: the SELECT must preserve every column and
+   * the hidden `_mxidx` (e.g. `SELECT * REPLACE(...) FROM data`). A SELECT that
+   * drops `_mxidx` or renames columns will fail safely (no partial write). */
+  const body = req.body ?? {};
+  const aiParams: ViewParams = {
+    cols: undefined,
+    search: typeof body.search === "string" ? body.search : "",
+    conditions: Array.isArray(body.conditions) ? body.conditions : [],
+    sort: null,
+    dupesOnly: !!body.dupesOnly,
+    blanksOnly: !!body.blanksOnly,
+    rowRange: body.rowRange ?? null,
+    withDupFlag: false,
+  };
+
+  let wrappedSql: string;
+  if (!viewHasFilter(aiParams, s)) {
+    /* Wrap the user SELECT in a CTE so "FROM data" resolves to the session CSV */
+    wrappedSql = `COPY (WITH data AS (SELECT * FROM ${srcExpr(s.dataPath)}) ${sql.trim()}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
+  } else {
+    const { cteSql, tbl, where } = composeView(s, aiParams);
+    const realCols = s.headers.map(quoteCol).join(", ");
+    wrappedSql =
+      `COPY (WITH ${cteSql}, ` +
+      `data AS (SELECT ${realCols}, _mxidx FROM ${tbl} ${where}), ` +
+      `ai AS (${sql.trim()}) ` +
+      `SELECT ${realCols} FROM (` +
+      `SELECT ${realCols}, _mxidx FROM ai ` +
+      `UNION ALL ` +
+      `SELECT ${realCols}, _mxidx FROM ${tbl} WHERE _mxidx NOT IN (SELECT _mxidx FROM data)` +
+      `) merged ORDER BY _mxidx` +
+      `) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
+  }
 
   try {
     await run(wrappedSql);
