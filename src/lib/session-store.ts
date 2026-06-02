@@ -47,8 +47,10 @@ export interface SessionMeta {
   summary?:  SummaryCache;
 }
 
-/* Max number of historical versions kept on disk per session for undo. */
-export const UNDO_DEPTH = 5;
+/* Max number of historical versions kept on disk per session for undo.
+ * Snapshot-based: each level costs ~one CSV copy on disk, so this is a
+ * deliberate cap (deep history × multi-million-row files would exhaust disk). */
+export const UNDO_DEPTH = 25;
 
 const sessions = new Map<string, SessionMeta>();
 const SESSION_TTL_MS = 2 * 60 * 60 * 1000; // 2 h
