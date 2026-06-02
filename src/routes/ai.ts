@@ -15,6 +15,12 @@ function getClient(): Anthropic {
   return new Anthropic({ apiKey });
 }
 
+/* ── DuckDB reader expression for stored CSV ── */
+function srcExpr(dataPath: string): string {
+  const p = dataPath.replace(/'/g, "''");
+  return `read_csv_auto('${p}', header=true, max_line_size=134217728, ignore_errors=true)`;
+}
+
 function buildQueryPrompt(
   headers: string[],
   colTypes: Record<string, string>,
@@ -43,7 +49,7 @@ RULES:
 4. Use DuckDB syntax (ILIKE, TRY_CAST, STRFTIME, etc.).
 5. If the question needs no SQL (chitchat, clarification), set "sql":"" and answer in "explanation".
 6. Never DROP, DELETE, INSERT, UPDATE — read-only only.
-7. Quote column names that have spaces or special chars.`;
+7. Quote column names that have spaces or special chars with double quotes.`;
 }
 
 function buildTransformPrompt(
@@ -74,7 +80,7 @@ RULES:
 4. Available: pandas (pd), numpy (np), re, json, math, string, datetime, itertools, collections.
 5. FORBIDDEN: os, sys, subprocess, shutil, socket, urllib, requests, open(), exec(), eval(), compile(), __import__.
 6. Handle missing values gracefully (fillna, dropna).
-7. If the request is ambiguous do the most reasonable interpretation.
+7. If the request is ambiguous, do the most reasonable interpretation.
 8. If the request is impossible or dangerous, leave df unchanged and explain in "explanation".`;
 }
 
@@ -82,20 +88,17 @@ RULES:
  * POST /api/mx/ai
  *
  * Body:
- *   session    — MasterX session ID
- *   message    — user's natural-language question or instruction
- *   credits    — user's current credit balance
- *   mode       — "query" (default) | "transform"
- *   history    — optional array of {role,content} for conversation context
+ *   session   — MasterX session ID
+ *   message   — user's natural-language question or instruction
+ *   credits   — user's current credit balance
+ *   mode      — "query" (default) | "transform"
+ *   history   — optional [{role,content}] for conversation context
  *
  * Query response:
  *   { ok:true, type:"query", answer, sql, rows, tokensUsed, creditsUsed }
  *
  * Transform response:
  *   { ok:true, type:"transform", code, explanation, tokensUsed, creditsUsed }
- *
- * Credit-gate (402):
- *   { error:"insufficient_credits", creditsRequired, creditsAvailable }
  */
 router.post("/mx/ai", async (req: Request, res: Response) => {
   const {
@@ -172,6 +175,7 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
       return;
     }
 
+    /* ── Transform response ── */
     if (mode === "transform" || parsed.type === "transform") {
       logger.info({ sessionId: session, mode: "transform", tokensUsed: totalTokens, creditsUsed }, "AI transform completed");
       res.json({
@@ -185,12 +189,13 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
       return;
     }
 
+    /* ── Query response — run the SQL ── */
     const { sql, explanation } = parsed;
     let rows: Record<string, unknown>[] = [];
 
     if (sql && sql.trim().length > 0) {
-      const parquetPath = s.parquetPath.replace(/'/g, "''");
-      const wrappedSql = `WITH data AS (SELECT * FROM read_parquet('${parquetPath}')) ${sql}`;
+      /* Wrap with a CTE so the AI's "FROM data" works against the CSV */
+      const wrappedSql = `WITH data AS (SELECT * FROM ${srcExpr(s.dataPath)}) ${sql}`;
       try {
         rows = await query(wrappedSql);
       } catch (sqlErr) {
@@ -208,8 +213,12 @@ router.post("/mx/ai", async (req: Request, res: Response) => {
       }
     }
 
-    logger.info({ sessionId: session, mode: "query", tokensUsed: totalTokens, creditsUsed, rowsReturned: rows.length }, "AI query completed");
+    logger.info(
+      { sessionId: session, mode: "query", tokensUsed: totalTokens, creditsUsed, rowsReturned: rows.length },
+      "AI query completed",
+    );
     res.json({ ok: true, type: "query", answer: explanation, sql, rows, tokensUsed: totalTokens, creditsUsed });
+
   } catch (err) {
     logger.error(err, "AI endpoint error");
     res.status(500).json({ error: (err as Error).message });
