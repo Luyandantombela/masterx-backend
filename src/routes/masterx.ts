@@ -8,11 +8,46 @@ import {
   createSession,
   getSession,
   deleteSession,
+  unlinkQuiet,
   UPLOAD_DIR,
+  UNDO_DEPTH,
+  type SessionMeta,
+  type ColQuality,
 } from "../lib/session-store.js";
 import { logger } from "../lib/logger.js";
 
 const router = Router();
+
+/* ── Versioning helpers (undo/redo) ──────────────────────────────────────
+ * Every mutation writes a fresh CSV to a tmp file, then we RENAME it to a new
+ * unique version path and remember the previous path for undo. No extra copy
+ * is made — the write already produced the new file. Disk usage is bounded to
+ * (UNDO_DEPTH + 1) historical versions per session.
+ */
+function newVersionPath(s: SessionMeta): string {
+  return path.join(
+    UPLOAD_DIR,
+    `${s.sessionId}_v${Date.now()}_${Math.random().toString(36).slice(2, 8)}.csv`,
+  );
+}
+
+function commitNewVersion(s: SessionMeta, tmpPath: string): void {
+  const dest = newVersionPath(s);
+  fs.renameSync(tmpPath, dest);
+  s.undoStack.push(s.dataPath);
+  s.dataPath = dest;
+  /* New edit creates a fresh branch — discard any redo history. */
+  for (const p of s.redoStack) unlinkQuiet(p);
+  s.redoStack = [];
+  /* Trim undo history beyond the configured depth. */
+  while (s.undoStack.length > UNDO_DEPTH) {
+    const old = s.undoStack.shift();
+    if (old) unlinkQuiet(old);
+  }
+  s.version++;
+  s.summary = undefined;
+  s.sortCache.clear();
+}
 
 /* ── Multer: accept CSV and JSON, store to UPLOAD_DIR ── */
 const upload = multer({
@@ -140,16 +175,16 @@ function parseCols(
     .filter((c) => allHeaders.includes(c));
 }
 
-function buildWhere(
+function buildPredicates(
   conditions: Array<{ col: string; op: string; value: string }>,
   searchQ: string,
   headers: string[],
-): string {
+): string[] {
   const parts: string[] = [];
   for (const { col, op, value } of conditions) {
     if (!headers.includes(col)) continue;
     const c = `"${col.replace(/"/g, '""')}"`;
-    const v = value.replace(/'/g, "''");
+    const v = String(value ?? "").replace(/'/g, "''");
     switch (op) {
       case "eq":
         parts.push(`${c} = '${v}'`);
@@ -175,6 +210,12 @@ function buildWhere(
       case "lt":
         parts.push(`TRY_CAST(${c} AS DOUBLE) < ${parseFloat(v) || 0}`);
         break;
+      case "ge":
+        parts.push(`TRY_CAST(${c} AS DOUBLE) >= ${parseFloat(v) || 0}`);
+        break;
+      case "le":
+        parts.push(`TRY_CAST(${c} AS DOUBLE) <= ${parseFloat(v) || 0}`);
+        break;
       case "blank":
         parts.push(`(${c} IS NULL OR ${c} = '')`);
         break;
@@ -190,7 +231,108 @@ function buildWhere(
       .map((h) => `"${h.replace(/"/g, '""')}" ILIKE '%${sq}%'`);
     if (searchParts.length) parts.push(`(${searchParts.join(" OR ")})`);
   }
+  return parts;
+}
+
+function buildWhere(
+  conditions: Array<{ col: string; op: string; value: string }>,
+  searchQ: string,
+  headers: string[],
+): string {
+  const parts = buildPredicates(conditions, searchQ, headers);
   return parts.length ? `WHERE ${parts.join(" AND ")}` : "";
+}
+
+/* ── Unified windowed-view composition ──────────────────────────────────
+ * Builds the CTE/WHERE/ORDER BY fragments shared by POST /mx/view and the
+ * filtered branch of GET /mx/export. All ops run on the backend; the browser
+ * only ever receives a single on-screen window plus aggregate summaries.
+ */
+interface ViewParams {
+  cols?: string[];
+  search?: string;
+  conditions?: Array<{ col: string; op: string; value: string }>;
+  sort?: { col: string; dir?: string; type?: string } | null;
+  dupesOnly?: boolean;
+  blanksOnly?: boolean;
+  rowRange?: { from?: unknown; to?: unknown } | null;
+  withDupFlag?: boolean;
+}
+
+interface ComposedView {
+  cteSql: string;
+  tbl: string;
+  where: string;
+  orderBy: string;
+  selCols: string[];
+  needDup: boolean;
+}
+
+function quoteCol(c: string): string {
+  return `"${c.replace(/"/g, '""')}"`;
+}
+
+function composeView(s: SessionMeta, p: ViewParams): ComposedView {
+  const src = srcExpr(s.dataPath);
+  const selCols =
+    Array.isArray(p.cols) && p.cols.length
+      ? p.cols.filter((c) => s.headers.includes(c))
+      : s.headers.slice();
+
+  const needDup = !!(p.withDupFlag || p.dupesOnly) && s.headers.length > 0;
+
+  /* Case-insensitive, trimmed full-row signature — matches the client's
+   * dedupe semantics (first occurrence kept, rest flagged as duplicates). */
+  const sig = s.headers.map((c) => `lower(trim(${quoteCol(c)}))`).join(", ");
+
+  let cteSql: string;
+  let tbl: string;
+  if (needDup) {
+    cteSql =
+      `base AS (SELECT *, (row_number() OVER ()) - 1 AS _mxidx FROM ${src}), ` +
+      `flagged AS (SELECT *, (row_number() OVER (PARTITION BY ${sig} ORDER BY _mxidx) > 1) AS _isdup FROM base)`;
+    tbl = "flagged";
+  } else {
+    cteSql = `base AS (SELECT *, (row_number() OVER ()) - 1 AS _mxidx FROM ${src})`;
+    tbl = "base";
+  }
+
+  const preds = buildPredicates(
+    p.conditions ?? [],
+    p.search ?? "",
+    s.headers,
+  );
+
+  if (p.blanksOnly) {
+    const bp = selCols.map((c) => {
+      const q = quoteCol(c);
+      return `(${q} IS NULL OR ${q} = '')`;
+    });
+    if (bp.length) preds.push(`(${bp.join(" OR ")})`);
+  }
+
+  if (p.rowRange) {
+    const f = parseInt(String(p.rowRange.from), 10);
+    const t = parseInt(String(p.rowRange.to), 10);
+    if (!isNaN(f)) preds.push(`(_mxidx + 1) >= ${f}`);
+    if (!isNaN(t)) preds.push(`(_mxidx + 1) <= ${t}`);
+  }
+
+  if (p.dupesOnly) preds.push(`_isdup`);
+
+  const where = preds.length ? `WHERE ${preds.join(" AND ")}` : "";
+
+  let orderBy = "ORDER BY _mxidx";
+  if (p.sort && p.sort.col && s.headers.includes(p.sort.col)) {
+    const sc = quoteCol(p.sort.col);
+    const dir = String(p.sort.dir).toLowerCase() === "desc" ? "DESC" : "ASC";
+    let expr = sc;
+    if (p.sort.type === "number") expr = `TRY_CAST(${sc} AS DOUBLE)`;
+    else if (p.sort.type === "date") expr = `TRY_CAST(${sc} AS DATE)`;
+    orderBy = `ORDER BY ${expr} ${dir} NULLS LAST, _mxidx`;
+  }
+
+  return { cteSql, tbl, where, orderBy, selCols, needDup };
 }
 
 /* ── POST /api/mx/upload ── */
@@ -437,13 +579,17 @@ router.patch("/mx/cell", async (req: Request, res: Response) => {
          FROM ${srcExpr(s.dataPath)}
        ) TO '${tmpPath.replace(/'/g, "''")}' (FORMAT CSV, HEADER true)`,
     );
-    fs.renameSync(tmpPath, s.dataPath);
-    s.sortCache.clear();
+    commitNewVersion(s, tmpPath);
     logger.info(
       { sessionId: s.sessionId, row: rowIdx, col, value: safeVal },
       `BACKEND: edited cell — column "${col}", row ${rowIdx}`,
     );
-    res.json({ ok: true });
+    res.json({
+      ok: true,
+      version: s.version,
+      canUndo: s.undoStack.length > 0,
+      canRedo: s.redoStack.length > 0,
+    });
   } catch (err) {
     try {
       fs.unlinkSync(tmpPath);
@@ -704,14 +850,22 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
       }
 
       case "delete-column": {
-        const { col } = params;
-        if (!s.headers.includes(col)) {
+        /* Accept a single `col` or a `cols` array so deleting several columns
+         * is one atomic op = one undo step. */
+        const reqCols = Array.isArray(params.cols)
+          ? params.cols
+          : params.col != null
+            ? [params.col]
+            : [];
+        const toDelete = reqCols.filter((c: string) => s.headers.includes(c));
+        if (!toDelete.length) {
           res.status(400).json({ error: "Column not found" });
           return;
         }
-        const remaining = s.headers.filter((h) => h !== col);
+        const delSet = new Set(toDelete);
+        const remaining = s.headers.filter((h) => !delSet.has(h));
         if (!remaining.length) {
-          res.status(400).json({ error: "Cannot delete the only column" });
+          res.status(400).json({ error: "Cannot delete all columns" });
           return;
         }
         const colList = remaining
@@ -802,14 +956,129 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
         break;
       }
 
+      case "dedupe": {
+        /* Keep the FIRST occurrence of each full-row signature (case-insensitive,
+         * trimmed) — matches the client's dedupe semantics. */
+        if (!s.headers.length) {
+          res.status(400).json({ error: "No columns to dedupe" });
+          return;
+        }
+        const sig = s.headers
+          .map((h) => `lower(trim("${h.replace(/"/g, '""')}"))`)
+          .join(", ");
+        const allCols = s.headers
+          .map((h) => `"${h.replace(/"/g, '""')}"`)
+          .join(", ");
+        sql = `COPY (
+          SELECT ${allCols} FROM (
+            SELECT *, row_number() OVER (PARTITION BY ${sig} ORDER BY _mxidx) AS _dn
+            FROM (SELECT *, (row_number() OVER ()) - 1 AS _mxidx FROM ${src})
+          ) WHERE _dn = 1
+        ) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
+        rowCountChange = true;
+        break;
+      }
+
+      /* ── Whole-file one-pass clean (blank-fill + casing/number/date/email
+       * normalization per column) — a single COPY so "Fix All" is one undo
+       * step regardless of column count. ── */
+      case "clean-all": {
+        const casing = String(params.casing ?? "title");
+        const decRaw = parseInt(String(params.decimals ?? 2));
+        const decimals = Math.max(0, Math.min(10, isNaN(decRaw) ? 2 : decRaw));
+        const duckFmt = String(params.dateFormat ?? "YYYY-MM-DD")
+          .replace("YYYY", "%Y")
+          .replace("MM", "%m")
+          .replace("DD", "%d")
+          .replace(/'/g, "''");
+        const defaults = (params.defaults ?? {}) as Record<string, unknown>;
+        const colTypes = (params.colTypes ?? {}) as Record<string, string>;
+        const defText = String(defaults.text ?? "N/A").replace(/'/g, "''");
+        const defNum = String(defaults.number ?? "0").replace(/'/g, "''");
+        const defDate = String(defaults.date ?? "0000-00-00").replace(
+          /'/g,
+          "''",
+        );
+        const defEmail = String(defaults.email ?? "N/A").replace(/'/g, "''");
+        const blankDefaults = (params.blankDefaults ?? {}) as Record<
+          string,
+          unknown
+        >;
+
+        if (!s.headers.length) {
+          res.status(400).json({ error: "No columns to clean" });
+          return;
+        }
+
+        const replaceExprs = s.headers.map((h) => {
+          const q = `"${h.replace(/"/g, '""')}"`;
+          const type = String(colTypes[h] ?? "text");
+          let dflt = defText;
+          if (type === "number") dflt = defNum;
+          else if (type === "date") dflt = defDate;
+          else if (type === "email") dflt = defEmail;
+          if (Object.prototype.hasOwnProperty.call(blankDefaults, h))
+            dflt = String(blankDefaults[h] ?? "").replace(/'/g, "''");
+          /* Transform the real (non-blank) value, then COALESCE to the
+           * default so the fill value is inserted verbatim (e.g. "N/A" is
+           * never itself title-cased to "N/a"). */
+          const base = `NULLIF(trim(${q}), '')`;
+          let t: string;
+          if (type === "number") {
+            t = `CASE WHEN TRY_CAST(${base} AS DOUBLE) IS NOT NULL THEN printf('%.${decimals}f', TRY_CAST(${base} AS DOUBLE)) ELSE ${base} END`;
+          } else if (type === "date") {
+            t = `CASE WHEN TRY_CAST(${base} AS DATE) IS NOT NULL THEN strftime(TRY_CAST(${base} AS DATE), '${duckFmt}') ELSE ${base} END`;
+          } else if (type === "email") {
+            t = `lower(${base})`;
+          } else if (casing === "upper") {
+            t = `upper(${base})`;
+          } else if (casing === "lower") {
+            t = `lower(${base})`;
+          } else {
+            t = `array_to_string(list_transform(string_split(lower(${base}), ' '), x -> upper(x[1:1]) || x[2:]), ' ')`;
+          }
+          return `COALESCE(${t}, '${dflt}') AS ${q}`;
+        });
+
+        sql = `COPY (SELECT * REPLACE (${replaceExprs.join(", ")}) FROM ${src}) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
+        break;
+      }
+
+      /* ── Delete every row matching the active view (filters/search/dupes/
+       * blanks/rowRange). Keeps the complement. Refuses an unfiltered call so
+       * we never wipe the whole file. ── */
+      case "delete-matching": {
+        const vp = (params.view ?? {}) as ViewParams;
+        const viewParams: ViewParams = {
+          search: typeof vp.search === "string" ? vp.search : "",
+          conditions: Array.isArray(vp.conditions) ? vp.conditions : [],
+          dupesOnly: !!vp.dupesOnly,
+          blanksOnly: !!vp.blanksOnly,
+          rowRange: vp.rowRange ?? null,
+          withDupFlag: !!vp.dupesOnly,
+        };
+        const cv = composeView(s, viewParams);
+        if (!cv.where) {
+          res.status(400).json({
+            error: "Refusing to delete the entire file; apply a filter first",
+          });
+          return;
+        }
+        const allCols = s.headers
+          .map((h) => `"${h.replace(/"/g, '""')}"`)
+          .join(", ");
+        sql = `COPY (WITH ${cv.cteSql} SELECT ${allCols} FROM ${cv.tbl} WHERE _mxidx NOT IN (SELECT _mxidx FROM ${cv.tbl} ${cv.where})) TO '${tmpSafe}' (FORMAT CSV, HEADER true)`;
+        rowCountChange = true;
+        break;
+      }
+
       default:
         res.status(400).json({ error: `Unknown operation: ${operation}` });
         return;
     }
 
     await run(sql);
-    fs.renameSync(tmpPath, s.dataPath);
-    s.sortCache.clear();
+    commitNewVersion(s, tmpPath);
 
     /* Refresh session metadata if schema or row count changed */
     if (structuralChange || rowCountChange) {
@@ -833,6 +1102,9 @@ router.post("/mx/bulk-transform", async (req: Request, res: Response) => {
       colCount: s.colCount,
       headers: s.headers,
       colTypes: s.colTypes,
+      version: s.version,
+      canUndo: s.undoStack.length > 0,
+      canRedo: s.redoStack.length > 0,
     });
   } catch (err) {
     try {
@@ -874,7 +1146,7 @@ router.post("/mx/apply-sql", async (req: Request, res: Response) => {
 
   try {
     await run(wrappedSql);
-    fs.renameSync(tmpPath, s.dataPath);
+    commitNewVersion(s, tmpPath);
     await refreshSessionMeta(s);
     logger.info(
       {
@@ -891,6 +1163,9 @@ router.post("/mx/apply-sql", async (req: Request, res: Response) => {
       colCount: s.colCount,
       headers: s.headers,
       colTypes: s.colTypes,
+      version: s.version,
+      canUndo: s.undoStack.length > 0,
+      canRedo: s.redoStack.length > 0,
     });
   } catch (err) {
     try {
@@ -900,10 +1175,408 @@ router.post("/mx/apply-sql", async (req: Request, res: Response) => {
   }
 });
 
-/* ── GET /api/mx/export ──
- *  Stream the stored CSV file directly — no DuckDB needed, instant start.
+/* ── POST /api/mx/view ──
+ *  Unified windowed read. Returns a single on-screen window of rows plus the
+ *  total matching count, computed entirely on the backend (DuckDB). Each row
+ *  carries a stable `_mxidx` (file-order index) and, when requested, `_isdup`.
+ *
+ *  Body: {
+ *    session, from, limit, cols?, search?, conditions?[],
+ *    sort?:{col,dir,type}, dupesOnly?, blanksOnly?, rowRange?:{from,to},
+ *    withDupFlag?
+ *  }
  */
-router.get("/mx/export", (req: Request, res: Response) => {
+router.post("/mx/view", async (req: Request, res: Response) => {
+  const body = req.body ?? {};
+  const s = getSession(body.session);
+  if (!s) {
+    res.status(404).json({ error: "Session not found or expired" });
+    return;
+  }
+
+  const safeFrom = Math.max(0, parseInt(String(body.from), 10) || 0);
+  const safeLimit = Math.min(
+    5000,
+    Math.max(1, parseInt(String(body.limit), 10) || 100),
+  );
+
+  const params: ViewParams = {
+    cols: Array.isArray(body.cols) ? body.cols : undefined,
+    search: typeof body.search === "string" ? body.search : "",
+    conditions: Array.isArray(body.conditions) ? body.conditions : [],
+    sort: body.sort && body.sort.col ? body.sort : null,
+    dupesOnly: !!body.dupesOnly,
+    blanksOnly: !!body.blanksOnly,
+    rowRange: body.rowRange ?? null,
+    withDupFlag: !!body.withDupFlag,
+  };
+
+  const hasFilter = viewHasFilter(params, s);
+
+  try {
+    /* Fast path: no filter/sort/dup → stream scan with LIMIT/OFFSET, which
+     * short-circuits the streaming row_number() window. Total is known. */
+    if (!hasFilter && !params.withDupFlag) {
+      const selCols =
+        params.cols && params.cols.length
+          ? params.cols.filter((c) => s.headers.includes(c))
+          : s.headers.slice();
+      const colList = selCols.map((c) => quoteCol(c)).join(", ");
+      const selectExpr = colList ? `${colList}, ` : "";
+      const rows = await query(
+        `SELECT ${selectExpr}(row_number() OVER ()) - 1 AS _mxidx ` +
+          `FROM ${srcExpr(s.dataPath)} LIMIT ${safeLimit} OFFSET ${safeFrom}`,
+      );
+      res.json({
+        rows,
+        total: s.rowCount,
+        from: safeFrom,
+        limit: safeLimit,
+        cols: selCols,
+      });
+      return;
+    }
+
+    /* General path: filter/sort/dup require a full scan + ORDER BY for stable
+     * pagination (preserve_insertion_order is off, so order must be explicit). */
+    const { cteSql, tbl, where, orderBy, selCols, needDup } = composeView(
+      s,
+      params,
+    );
+    const colList = selCols.map((c) => quoteCol(c)).join(", ");
+    const selectExpr = colList ? `${colList}, ` : "";
+    const flagSel = needDup ? ", _isdup" : "";
+
+    const countRes = await query(
+      `WITH ${cteSql} SELECT COUNT(*) AS total FROM ${tbl} ${where}`,
+    );
+    const total = Number(countRes[0]?.total ?? 0);
+
+    const rows = await query(
+      `WITH ${cteSql} SELECT ${selectExpr}_mxidx${flagSel} FROM ${tbl} ${where} ${orderBy} ` +
+        `LIMIT ${safeLimit} OFFSET ${safeFrom}`,
+    );
+
+    res.json({ rows, total, from: safeFrom, limit: safeLimit, cols: selCols });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+/* ── Quality-detection SQL (mirrors the client's JS rules exactly) ──
+ * These run over the FULL file on the backend so the browser never inspects
+ * more than its on-screen window. `q` is an already-quoted column reference.
+ */
+
+/* Text-casing pattern of a value: 'upper' | 'lower' | 'title' | 'mixed'
+ * (matches getCasingPattern in masterx_updated.html). */
+function casingPatternSql(q: string): string {
+  return `CASE
+      WHEN trim(${q}) = upper(trim(${q})) AND regexp_matches(trim(${q}), '[A-Z]') THEN 'upper'
+      WHEN trim(${q}) = lower(trim(${q})) THEN 'lower'
+      WHEN list_aggregate(list_transform(string_split_regex(trim(${q}), '\\s+'),
+            w -> ((w = upper(w) AND length(w) <= 3)
+                  OR (left(w, 1) = upper(left(w, 1)) AND substr(w, 2) = lower(substr(w, 2))))
+          ), 'bool_and') THEN 'title'
+      ELSE 'mixed'
+    END`;
+}
+
+/* Date format of a value: 'YYYY/MM/DD' | 'DD/MM/YYYY' | 'MM/DD/YYYY' | 'unknown'
+ * (matches detectDateFormat in masterx_updated.html). */
+function dateFormatSql(q: string): string {
+  return `CASE
+      WHEN regexp_matches(trim(${q}), '^\\d{4}[-/]\\d{2}[-/]\\d{2}$') THEN 'YYYY/MM/DD'
+      WHEN regexp_matches(trim(${q}), '^\\d{2}[-/]\\d{2}[-/]\\d{4}$') THEN
+        CASE WHEN TRY_CAST(split_part(replace(trim(${q}), '-', '/'), '/', 1) AS INTEGER) > 12
+             THEN 'DD/MM/YYYY' ELSE 'MM/DD/YYYY' END
+      ELSE 'unknown'
+    END`;
+}
+
+/* Boolean: value is a non-blank invalid email (matches isInvalidEmail). */
+function emailInvalidSql(q: string): string {
+  const e = `lower(trim(${q}))`;
+  return `(${q} IS NOT NULL AND trim(${q}) <> '' AND (
+      ${e} IN ('none', 'null', 'n/a', 'na')
+      OR position('@' IN ${e}) = 0
+      OR ${e} LIKE '@%'
+      OR ${e} LIKE '%@'
+      OR NOT regexp_matches(split_part(${e}, '@', 2), '\\.[a-z]{2,}$')
+    ))`;
+}
+
+/* Dominant value + count-of-mismatches over a grouped {value,count} result.
+ * Returns issues = 0 when there is only a single distinct group (matches the
+ * client, which reports inconsistencies only when >1 distinct pattern). */
+function dominantAndIssues(
+  rows: Array<Record<string, unknown>>,
+  valueKey: string,
+): { dominant: string; issues: number } {
+  let total = 0;
+  let maxCount = -1;
+  let dominant = "";
+  for (const r of rows) {
+    const c = Number(r.c ?? 0);
+    total += c;
+    if (c > maxCount) {
+      maxCount = c;
+      dominant = String(r[valueKey] ?? "");
+    }
+  }
+  const issues = rows.length > 1 ? total - maxCount : 0;
+  return { dominant, issues };
+}
+
+/* ── POST /api/mx/summary ──
+ *  Whole-file quality aggregates computed entirely on the backend:
+ *  duplicate count, blank counts per column, plus per-column casing / date /
+ *  email issue counts (driven by the client-supplied semantic `colTypes`).
+ *  Cached on the session and invalidated on every mutation (via version) or
+ *  whenever the column types change.
+ *
+ *  Body: { session, colTypes?: { [col]: 'text'|'number'|'date'|'email'|... } }
+ */
+router.post("/mx/summary", async (req: Request, res: Response) => {
+  const s = getSession(req.body?.session);
+  if (!s) {
+    res.status(404).json({ error: "Session not found or expired" });
+    return;
+  }
+
+  const colTypes: Record<string, string> =
+    req.body?.colTypes && typeof req.body.colTypes === "object"
+      ? (req.body.colTypes as Record<string, string>)
+      : {};
+  const colTypesKey = JSON.stringify(colTypes);
+
+  const respond = (sum: typeof s.summary, cached: boolean) => {
+    if (!sum) return;
+    res.json({
+      ok: true,
+      rowCount: s.rowCount,
+      colCount: s.colCount,
+      dupCount: sum.dupCount,
+      totalBlanks: sum.totalBlanks,
+      blanksByCol: sum.blanksByCol,
+      casingTotal: sum.casingTotal,
+      dateTotal: sum.dateTotal,
+      emailTotal: sum.emailTotal,
+      qualityByCol: sum.qualityByCol,
+      cached,
+    });
+  };
+
+  if (
+    s.summary &&
+    s.summary.version === s.version &&
+    s.summary.colTypesKey === colTypesKey
+  ) {
+    respond(s.summary, true);
+    return;
+  }
+
+  const cols = s.headers;
+  if (!cols.length) {
+    s.summary = {
+      version: s.version,
+      colTypesKey,
+      dupCount: 0,
+      totalBlanks: 0,
+      blanksByCol: {},
+      casingTotal: 0,
+      dateTotal: 0,
+      emailTotal: 0,
+      qualityByCol: {},
+    };
+    respond(s.summary, false);
+    return;
+  }
+
+  const src = srcExpr(s.dataPath);
+  const sig = cols.map((c) => `lower(trim(${quoteCol(c)}))`).join(", ");
+
+  try {
+    /* Duplicate rows (full-row, case-insensitive, first occurrence kept). */
+    const dupRes = await query(
+      `WITH base AS (SELECT *, (row_number() OVER ()) - 1 AS _mxidx FROM ${src}), ` +
+        `f AS (SELECT (row_number() OVER (PARTITION BY ${sig} ORDER BY _mxidx) > 1) AS d FROM base) ` +
+        `SELECT COUNT(*) AS dupCount FROM f WHERE d`,
+    );
+    const dupCount = Number(dupRes[0]?.dupCount ?? 0);
+
+    /* Blanks per column + invalid-email counts for email columns: one pass. */
+    const aggExprs = cols.map((c, i) => {
+      const q = quoteCol(c);
+      const parts = [
+        `SUM(CASE WHEN ${q} IS NULL OR ${q} = '' THEN 1 ELSE 0 END) AS b${i}`,
+      ];
+      if (colTypes[c] === "email") {
+        parts.push(`SUM(CASE WHEN ${emailInvalidSql(q)} THEN 1 ELSE 0 END) AS e${i}`);
+      }
+      return parts.join(", ");
+    });
+    const aggRes = await query(`SELECT ${aggExprs.join(", ")} FROM ${src}`);
+    const row0 = (aggRes[0] ?? {}) as Record<string, unknown>;
+
+    const blanksByCol: Record<string, number> = {};
+    const qualityByCol: Record<string, ColQuality> = {};
+    let totalBlanks = 0;
+    let emailTotal = 0;
+    cols.forEach((c, i) => {
+      const n = Number(row0["b" + i] ?? 0);
+      blanksByCol[c] = n;
+      totalBlanks += n;
+      if (colTypes[c] === "email") {
+        const ei = Number(row0["e" + i] ?? 0);
+        emailTotal += ei;
+        qualityByCol[c] = { type: "email", emailIssues: ei };
+      }
+    });
+
+    /* Per-column casing (text) and date (date) — grouped pattern queries.
+     * Each is over non-blank values only, matching the client. */
+    let casingTotal = 0;
+    let dateTotal = 0;
+    for (const c of cols) {
+      const t = colTypes[c];
+      const q = quoteCol(c);
+      const nonBlank = `${q} IS NOT NULL AND trim(${q}) <> ''`;
+      if (t === "text") {
+        const gr = await query(
+          `SELECT pat, COUNT(*) AS c FROM ` +
+            `(SELECT ${casingPatternSql(q)} AS pat FROM ${src} WHERE ${nonBlank}) ` +
+            `GROUP BY pat`,
+        );
+        const { dominant, issues } = dominantAndIssues(gr, "pat");
+        casingTotal += issues;
+        qualityByCol[c] = { type: "text", casingPattern: dominant, casingIssues: issues };
+      } else if (t === "date") {
+        const gr = await query(
+          `SELECT fmt, COUNT(*) AS c FROM ` +
+            `(SELECT ${dateFormatSql(q)} AS fmt FROM ${src} WHERE ${nonBlank}) ` +
+            `GROUP BY fmt`,
+        );
+        const { dominant, issues } = dominantAndIssues(gr, "fmt");
+        dateTotal += issues;
+        qualityByCol[c] = { type: "date", dateFormat: dominant, dateIssues: issues };
+      }
+    }
+
+    s.summary = {
+      version: s.version,
+      colTypesKey,
+      dupCount,
+      totalBlanks,
+      blanksByCol,
+      casingTotal,
+      dateTotal,
+      emailTotal,
+      qualityByCol,
+    };
+    respond(s.summary, false);
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+/* ── POST /api/mx/undo and /api/mx/redo ──
+ *  Restore the previous / next stored version (file-swap, no data copy).
+ */
+async function restoreVersion(
+  s: SessionMeta,
+  from: "undo" | "redo",
+): Promise<void> {
+  if (from === "undo") {
+    const prev = s.undoStack.pop()!;
+    s.redoStack.push(s.dataPath);
+    s.dataPath = prev;
+  } else {
+    const next = s.redoStack.pop()!;
+    s.undoStack.push(s.dataPath);
+    s.dataPath = next;
+  }
+  s.version++;
+  s.summary = undefined;
+  await refreshSessionMeta(s);
+}
+
+router.post("/mx/undo", async (req: Request, res: Response) => {
+  const s = getSession(req.body?.session);
+  if (!s) {
+    res.status(404).json({ error: "Session not found or expired" });
+    return;
+  }
+  if (!s.undoStack.length) {
+    res.status(400).json({ error: "Nothing to undo" });
+    return;
+  }
+  try {
+    await restoreVersion(s, "undo");
+    res.json({
+      ok: true,
+      rowCount: s.rowCount,
+      colCount: s.colCount,
+      headers: s.headers,
+      colTypes: s.colTypes,
+      version: s.version,
+      canUndo: s.undoStack.length > 0,
+      canRedo: s.redoStack.length > 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+router.post("/mx/redo", async (req: Request, res: Response) => {
+  const s = getSession(req.body?.session);
+  if (!s) {
+    res.status(404).json({ error: "Session not found or expired" });
+    return;
+  }
+  if (!s.redoStack.length) {
+    res.status(400).json({ error: "Nothing to redo" });
+    return;
+  }
+  try {
+    await restoreVersion(s, "redo");
+    res.json({
+      ok: true,
+      rowCount: s.rowCount,
+      colCount: s.colCount,
+      headers: s.headers,
+      colTypes: s.colTypes,
+      version: s.version,
+      canUndo: s.undoStack.length > 0,
+      canRedo: s.redoStack.length > 0,
+    });
+  } catch (err) {
+    res.status(500).json({ error: (err as Error).message });
+  }
+});
+
+/* ── GET /api/mx/export ──
+ *  Default: stream the stored CSV file directly — no DuckDB needed, instant.
+ *  Filtered: pass ?q=<url-encoded JSON view params> to export only the rows
+ *  matching the active search/filter/sort/dupes/blanks/rowRange view. The
+ *  filtered result is materialized by DuckDB to a temp file, streamed, then
+ *  deleted.
+ */
+function viewHasFilter(p: ViewParams, s: SessionMeta): boolean {
+  return !!(
+    (p.conditions && p.conditions.length) ||
+    (p.search && String(p.search).trim()) ||
+    (p.sort && p.sort.col) ||
+    p.dupesOnly ||
+    p.blanksOnly ||
+    (p.rowRange &&
+      (String(p.rowRange.from ?? "") !== "" ||
+        String(p.rowRange.to ?? "") !== "")) ||
+    (Array.isArray(p.cols) && p.cols.length > 0 && p.cols.length < s.headers.length)
+  );
+}
+
+router.get("/mx/export", async (req: Request, res: Response) => {
   const s = getSession(req.query.session as string);
   if (!s) {
     res.status(404).json({ error: "Session not found or expired" });
@@ -912,6 +1585,64 @@ router.get("/mx/export", (req: Request, res: Response) => {
 
   const safeName =
     s.fileName.replace(/"/g, "").replace(/\.[^.]+$/, "") + "_export.csv";
+
+  let viewParams: ViewParams | null = null;
+  if (req.query.q) {
+    try {
+      viewParams = JSON.parse(String(req.query.q)) as ViewParams;
+    } catch {
+      viewParams = null;
+    }
+  }
+
+  /* ── Filtered export path: materialize subset via DuckDB, then stream ── */
+  if (viewParams && viewHasFilter(viewParams, s)) {
+    const { cteSql, tbl, where, orderBy, selCols } = composeView(s, viewParams);
+    const colList = (selCols.length ? selCols : s.headers)
+      .map((c) => quoteCol(c))
+      .join(", ");
+    const outPath = path.join(
+      UPLOAD_DIR,
+      `${s.sessionId}_export_${Date.now()}.csv`,
+    );
+    const outSafe = outPath.replace(/'/g, "''");
+    const copySql = `COPY (WITH ${cteSql} SELECT ${colList} FROM ${tbl} ${where} ${orderBy}) TO '${outSafe}' (FORMAT CSV, HEADER true)`;
+    try {
+      await run(copySql);
+      const size = (() => {
+        try {
+          return fs.statSync(outPath).size;
+        } catch {
+          return 0;
+        }
+      })();
+      res.setHeader(
+        "Content-Disposition",
+        `attachment; filename="${safeName}"`,
+      );
+      res.setHeader("Content-Type", "text/csv; charset=utf-8");
+      if (size > 0) res.setHeader("Content-Length", size.toString());
+      const stream = fs.createReadStream(outPath);
+      stream.pipe(res);
+      const cleanup = () => unlinkQuiet(outPath);
+      stream.on("error", () => {
+        cleanup();
+        res.end();
+      });
+      stream.on("close", cleanup);
+      res.on("close", cleanup);
+    } catch (err) {
+      unlinkQuiet(outPath);
+      if (!res.headersSent) {
+        res.status(500).json({ error: (err as Error).message });
+      } else {
+        res.end();
+      }
+    }
+    return;
+  }
+
+  /* ── Fast path: stream the whole stored CSV verbatim ── */
   const size = (() => {
     try {
       return fs.statSync(s.dataPath).size;
